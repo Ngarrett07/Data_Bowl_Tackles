@@ -1,0 +1,507 @@
+---
+title: "Metric and Model"
+author: "Natalie Garrett"
+date: "2023-12-23"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Load in libraries
+```{r libraries}
+library(readr)
+library(ggplot2)
+library(dplyr)
+library(tidyverse)
+library(gganimate)
+library(repr)
+library(caTools)
+library(MASS)
+library(caret)
+library(nortest)
+```
+
+get data
+```{r getData}
+games <- read_csv("games.csv")
+players <- read_csv("players.csv")
+plays <- read_csv("plays.csv")
+tackles <- read_csv("tackles.csv")
+tracking_week_1 <- read_csv("tracking_week_1.csv")
+tracking_week_2 <- read_csv("tracking_week_2.csv")
+tracking_week_3 <- read_csv("tracking_week_3.csv")
+tracking_week_4 <- read_csv("tracking_week_4.csv")
+tracking_week_5 <- read_csv("tracking_week_5.csv")
+tracking_week_6 <- read_csv("tracking_week_6.csv")
+tracking_week_7 <- read_csv("tracking_week_7.csv")
+tracking_week_8 <- read_csv("tracking_week_8.csv")
+tracking_week_9 <- read_csv("tracking_week_9.csv")
+```
+
+```{r function}
+metric_creation <- function(tracking_data) {
+# save plays with no penalty only and only needed columns
+nonPenaltyPlays <- plays %>% filter(playNullifiedByPenalty != 'Y') %>% 
+  dplyr::select(c(gameId, playId, defensiveTeam, ballCarrierId, 
+           ballCarrierDisplayName, passResult))
+
+# only want data that has tracking data of players and football
+tracking_data <- tracking_data %>% group_by(gameId, playId, frameId) %>%
+  filter(sum(displayName != 'football')>0) 
+
+# data after tackle is irrelevant to scope
+tracking_data <- tracking_data %>% group_by(gameId, playId) %>%
+  mutate(last_frame = ifelse(frameId == max(frameId), "end", event)) %>% 
+  ungroup()
+
+tracking_data <- tracking_data %>% 
+  fill(last_frame, .direction = 'up') %>% 
+  filter(last_frame != 'end') %>%
+  dplyr::select(-c(last_frame))
+
+# join the dataframes and add metric of which side of ball player is on
+tracking_data <- inner_join(tracking_data, nonPenaltyPlays, 
+  by = c("gameId" = "gameId", "playId" = "playId")) %>%
+  mutate(sideOfBall = ifelse(club == defensiveTeam, 'defense', 'offense'))
+
+# standardize field and measurements as well as get metrics relevant to football and the horizontal/vertical movement of player
+tracking_data$x <- ifelse(tracking_data$playDirection == "left",
+                          120-tracking_data$x, tracking_data$x)
+tracking_data$y <- ifelse(tracking_data$playDirection == "left", 
+                          160/3 - tracking_data$y,tracking_data$y)
+tracking_data$dir <- ifelse(tracking_data$playDirection == "left",
+                            360-tracking_data$dir,tracking_data$dir)
+tracking_data$o <- ifelse(tracking_data$playDirection == "left",
+                          360-tracking_data$o, tracking_data$o)
+tracking_data <- tracking_data %>% group_by(gameId, playId, frameId) %>%
+  mutate(footballInPlay = sum(displayName == 'football')>0) %>%
+  filter(footballInPlay) %>% 
+  ungroup()
+
+# make sure ball carrier tracking data is present
+tracking_data <- tracking_data %>% group_by(gameId, playId, frameId) %>%
+  filter(sum(displayName == ballCarrierDisplayName)==1) 
+
+# add more metrics, including tracking x, y of ball carrier, separation between ball carrier, the x and y separation, vertical side of ball carrier (behind, in front, next to, and if player is chasing defender)
+tracking_data$xs <- tracking_data$s*cos(tracking_data$dir*(pi/180))
+tracking_data$ys <- tracking_data$s*sin(tracking_data$dir*(pi/180))
+tracking_data$xa <- tracking_data$a*cos(tracking_data$dir*(pi/180))
+tracking_data$ya <- tracking_data$a*sin(tracking_data$dir*(pi/180))
+tracking_data$sideline_dist <- ifelse(tracking_data$y < 53.33/2,
+                        tracking_data$y-0,53.33-tracking_data$y)
+
+tracking_data <- tracking_data %>%
+  group_by(gameId, playId, frameId) %>%
+  mutate(xBallCarrier = x[displayName == ballCarrierDisplayName],
+         yBallCarrier = y[displayName == ballCarrierDisplayName]) %>%
+  ungroup() %>%
+  group_by(gameId, playId) %>%
+  mutate(separation = sqrt((x-xBallCarrier)^2+(y-yBallCarrier)^2),
+         xSeparation = x-xBallCarrier, ySeparation = y-yBallCarrier) %>%
+  ungroup() 
+
+tracking_data$vSideOfPlayer <- ifelse(tracking_data$xSeparation > 0, 'behind',
+                      ifelse(tracking_data$xSeparation < 0, 'front', 'nextTo'))
+tracking_data$chasing = ifelse(tracking_data$vSideOfPlayer == 'behind', 1, 0)
+
+
+# add more metrics, the speeds or accel in relation to ball carrier
+tracking_data <- tracking_data %>% group_by(gameId, playId, frameId) %>%
+  mutate(xBCrelsDef = xs - xs[displayName == ballCarrierDisplayName],
+         yBCrelsDef = ys - ys[displayName == ballCarrierDisplayName],
+         xBCrelaDef = xa - xa[displayName == ballCarrierDisplayName],
+         yBCrelaDef = ya - ya[displayName == ballCarrierDisplayName])
+
+tracking_data <- tracking_data %>%  group_by(gameId, playId, nflId) %>%
+  mutate(deltaS = s- lag(s), deltaA = a- lag(a),
+         deltaDir = dir- lag(dir), deltaO = o- lag(o),
+         deltaXS = xs- lag(xs), deltaYS = ys- lag(ys),
+         deltaXA = xa- lag(xa), deltaYA = ya- lag(ya))
+
+# scramble - filter at run to tackle
+# run - filter at handoff to tackle
+# pass - filter pass outcome caught to tackle
+passingPlay <- tracking_data %>%
+  filter(passResult == 'C') %>%
+  mutate(start_frame = ifelse(is.na(event), 0, 
+                  ifelse(event == 'pass_outcome_caught', frameId, 0))) %>%
+  group_by(gameId, playId, nflId) %>%
+  mutate(irrelevant_frame = ifelse(frameId < max(start_frame), 
+                                   TRUE, FALSE)) %>%
+  ungroup() %>%
+  filter(irrelevant_frame != TRUE) %>% 
+  dplyr::select(-c(start_frame,irrelevant_frame)) %>%
+  filter(separation < 5)
+
+rushingPlay <- tracking_data %>%
+  filter(is.na(passResult)) %>%
+  mutate(start_frame = ifelse(is.na(event), 0, 
+                  ifelse(event == 'handoff', frameId, 0))) %>%
+  group_by(gameId, playId, nflId) %>%
+  mutate(irrelevant_frame = ifelse(frameId < max(start_frame), 
+                                   TRUE, FALSE)) %>%
+  ungroup() %>%
+  filter(irrelevant_frame != TRUE) %>% 
+  dplyr::select(-c(start_frame,irrelevant_frame)) %>%
+  filter(separation < 5)
+
+scramblePlay <- tracking_data %>%
+  filter(passResult == 'R') %>%
+  mutate(start_frame = ifelse(is.na(event), 0, 
+                  ifelse(event == 'run', frameId, 0))) %>%
+  group_by(gameId, playId, nflId) %>%
+  mutate(irrelevant_frame = ifelse(frameId < max(start_frame), 
+                                   TRUE, FALSE)) %>%
+  ungroup() %>%
+  filter(irrelevant_frame != TRUE) %>% 
+  dplyr::select(-c(start_frame,irrelevant_frame)) %>%
+  filter(separation < 5)
+
+tracking_data <- rbind(passingPlay, rushingPlay, scramblePlay)
+
+return(tracking_data)
+}
+
+tracking_test_1 <- metric_creation(tracking_week_1)
+tracking_test_2 <- metric_creation(tracking_week_2)
+tracking_test_3 <- metric_creation(tracking_week_3)
+tracking_test_4 <- metric_creation(tracking_week_4)
+tracking_test_5 <- metric_creation(tracking_week_5)
+tracking_test_6 <- metric_creation(tracking_week_6)
+tracking_test_7 <- metric_creation(tracking_week_7)
+tracking_test_8 <- metric_creation(tracking_week_8)
+tracking_test_9 <- metric_creation(tracking_week_9)
+
+tracking_data <- rbind(tracking_test_1, tracking_test_2,tracking_test_3,
+                    tracking_test_4,
+                    tracking_test_5, tracking_test_6,tracking_test_7,
+                    tracking_test_8,tracking_test_9)
+
+```
+
+this model focus on plays where a completion was made and no penalty was called
+prediction model only looks at when the players are within 5 yards of the ball carrier, considers only tackle data where a missed tackle, tackle or assist has occurred
+
+```{r modelData}
+only_tackles <- tackles %>%
+  mutate(Tackle = ifelse((tackle == 1) | (assist == 1) ,
+                         1, 0)) %>%
+  filter(forcedFumble != 1)
+
+defender_data <- tracking_data %>%
+  filter(sideOfBall == 'defense') 
+
+defender_data <- inner_join(defender_data, players, 
+  by = c("nflId" = "nflId", "displayName" = "displayName")) %>%
+  rename(tacklerPosition = position) %>%
+  dplyr::select(-c(weight, height, birthDate, collegeName))
+
+
+defender_data <- inner_join(defender_data, players, 
+  by = c("ballCarrierId" = "nflId", 
+         "ballCarrierDisplayName" = "displayName")) %>%
+  rename(ballCarrierPosition = position) %>%
+  dplyr::select(-c(weight, height, birthDate, collegeName))
+
+defender_data$tacklerPosition <- as.factor(defender_data$tacklerPosition)
+defender_data$ballCarrierPosition <-
+  as.factor(defender_data$ballCarrierPosition)
+defender_data$matchUpCombination <- paste(defender_data$tacklerPosition,
+                              defender_data$ballCarrierPosition, sep = ', ')
+
+defender_data <- left_join(defender_data, only_tackles, 
+  by = c("gameId" = "gameId", "playId" = "playId", "nflId" = "nflId")) %>%
+  distinct() %>%
+  mutate(tackleMade = ifelse(is.na(Tackle), 0, Tackle)) %>%
+  dplyr::select(-c(Tackle))
+
+ballCarrier_data <- tracking_data %>%
+  filter((displayName == ballCarrierDisplayName)) %>%
+  dplyr::select(c(gameId, playId, frameId,s,a,dis,dir,o,xs,ys,xa,ya,
+                 deltaS,deltaA,deltaXS,deltaYS,sideline_dist,deltaDir, 
+                 deltaO)) %>%
+  rename(BCs = s,BCa = a,BCdis = dis,BCdir=dir,BCo = o,
+         BCxs=xs,BCys=ys,BCxa=xa,BCya=ya,BCdeltaS = deltaS,BCdeltaA = deltaA,
+         BCdeltaXS=deltaXS,BCdeltaYS=deltaYS,BCsideline_dist=sideline_dist,
+         BCdeltaDir=deltaDir, BCdeltaO=deltaO)
+
+ballCarrier_data <- inner_join(ballCarrier_data, defender_data,
+  by = c("gameId" = "gameId", "playId" = "playId", "frameId" = "frameId")) %>%
+  dplyr::select(-c(s,a,dis,dir,o,xs,ys,xa,ya,
+                 deltaS,deltaA,deltaXS,deltaYS,sideline_dist))
+```
+
+
+```{r normalityTesting}
+# check that data follow normal distribution to verify assumption when using QDA and LDA
+sample_data <-defender_data %>%
+  dplyr::select(c(s,a,dis,dir,o,xs,ys,xa,ya,xBCrelsDef,yBCrelsDef,
+                 xBCrelaDef,yBCrelaDef,xSeparation,ySeparation,
+                 chasing,deltaS,deltaA,deltaXS,deltaYS,sideline_dist,
+                 deltaDir, deltaO))
+
+for (i in colnames(sample_data)){
+  if (ad.test(sample_data[[i]])[2] > 0.05) {
+    print('defender')
+    print(i)
+    print(ad.test(sample_data[[i]])[2])
+  }
+}
+
+sample_data <- ballCarrier_data %>%
+  dplyr::select(c(BCs,BCa,BCdis,BCdir,BCo,BCxs,BCys,BCxa,BCya,
+                 xBCrelsDef,yBCrelsDef,xBCrelaDef,yBCrelaDef,xSeparation,
+                 ySeparation,chasing,BCdeltaS,BCdeltaA,BCdeltaXS,BCdeltaYS,
+                 BCsideline_dist,deltaDir, deltaO))
+
+for (i in colnames(sample_data)){
+  if (ad.test(sample_data[[i]])[2] > 0.05) {
+    print('BC')
+    print(i)
+    print(ad.test(sample_data[[i]])[2])
+  }
+}
+```
+
+```{r BCmodel}
+set.seed(1)
+split <- sample.split(ballCarrier_data$gameId, SplitRatio = 0.8)
+
+train_reg <- subset(ballCarrier_data, split == "TRUE")
+test_reg <- subset(ballCarrier_data, split == "FALSE")
+
+# create multiple models to determine best classification model
+QDA_mod <- qda(tackleMade ~ BCs+BCa+BCdis+BCdir+BCo+BCxs+BCys+BCxa+BCya+
+                 xBCrelsDef+yBCrelsDef+BCdeltaDir+BCdeltaO+
+                 xBCrelaDef+yBCrelaDef+xSeparation+ySeparation+
+                 chasing+BCdeltaS+BCdeltaA+BCdeltaXS+BCdeltaYS+BCsideline_dist,
+                    data = train_reg)
+
+qda.pred1 = suppressWarnings(predict(QDA_mod,test_reg))
+
+confusionMatrix(table(qda.pred1$class,test_reg$tackleMade))
+
+log_mod <- glm(tackleMade ~ BCs+BCa+BCdis+BCdir+BCo+BCxs+BCys+BCxa+BCya+
+                 xBCrelsDef+yBCrelsDef+BCdeltaDir+BCdeltaO+
+                 xBCrelaDef+yBCrelaDef+xSeparation+ySeparation+
+                 chasing+BCdeltaS+BCdeltaA+BCdeltaXS+BCdeltaYS+BCsideline_dist,
+                    data = train_reg,
+               family = "binomial")
+
+summary(log_mod)
+glm.probs1=predict(log_mod,test_reg,type="response")
+n=dim(test_reg)[1]
+glm.pred1=rep(0,n)
+glm.pred1[glm.probs1>0.5]=1
+confusionMatrix(table(glm.pred1,test_reg$tackleMade))
+
+LDA_mod <- lda(tackleMade ~ BCs+BCa+BCdis+BCdir+BCo+BCxs+BCys+BCxa+BCya+
+                 xBCrelsDef+yBCrelsDef+BCdeltaDir+BCdeltaO+
+                 xBCrelaDef+yBCrelaDef+xSeparation+ySeparation+
+                 chasing+BCdeltaS+BCdeltaA+BCdeltaXS+BCdeltaYS+BCsideline_dist,
+                    data = train_reg)
+
+lda.pred1 = suppressWarnings(predict(LDA_mod,test_reg))
+confusionMatrix(table(lda.pred1$class,test_reg$tackleMade))
+
+# QDA is best model
+pred1 = suppressWarnings(round(predict(QDA_mod,
+              ballCarrier_data)$posterior[,2], digits = 4)) 
+ballCarrier_data$tackleProbability<- pred1
+
+single_game <- ballCarrier_data %>% filter(gameId == 2022101605 
+                                          & playId == 3778)
+ggplot(single_game,
+       aes(x=x,y=y, color = tackleProbability, shape = displayName )) + 
+  geom_line() + facet_grid(playId ~ .)
+
+
+ggplot(single_game,
+       aes(x=frameId,y= tackleProbability, color = displayName )) + 
+  geom_line() 
+
+# reset single_game data frame to graph new data
+single_game <- ballCarrier_data %>% filter(playId == 1182	
+                                          & gameId == 2022102000)
+
+ggplot(single_game,
+       aes(x=x,y=y, color = tackleProbability,
+           shape = displayName )) + 
+  geom_line() + facet_grid(playId ~ .)
+
+ggplot(single_game,
+       aes(x=frameId,y= tackleProbability, color = displayName )) + 
+  geom_line() 
+
+```
+
+
+```{r Defmodel}
+set.seed(1)
+split <- sample.split(defender_data$gameId, SplitRatio = 0.8)
+
+train_reg <- subset(defender_data, split == "TRUE")
+test_reg <- subset(defender_data, split == "FALSE")
+
+# create multiple models to determine best classification model
+QDA_mod <- qda(tackleMade ~ s+a+dis+dir+o+xs+ys+xa+ya+xBCrelsDef+
+                 yBCrelsDef+deltaDir+deltaO+
+                 xBCrelaDef+yBCrelaDef+xSeparation+ySeparation+
+                 chasing+deltaS+deltaA+deltaXS+deltaYS+sideline_dist,
+                    data = train_reg)
+
+qda.pred1 = suppressWarnings(predict(QDA_mod,test_reg))
+confusionMatrix(table(qda.pred1$class,test_reg$tackleMade))
+
+LDA_mod <- lda(tackleMade ~ s+a+dis+dir+o+xs+ys+xa+ya+xBCrelsDef+
+                 yBCrelsDef+deltaDir+deltaO+
+                 xBCrelaDef+yBCrelaDef+xSeparation+ySeparation+
+                 chasing+deltaS+deltaA+deltaXS+deltaYS+sideline_dist,
+                    data = train_reg)
+
+lda.pred1 = suppressWarnings(predict(LDA_mod,test_reg))
+confusionMatrix(table(lda.pred1$class,test_reg$tackleMade))
+
+log_mod <- glm(tackleMade ~ s+a+dis+dir+o+xs+ys+xa+ya+xBCrelsDef+
+                 yBCrelsDef+deltaDir+deltaO+
+                 xBCrelaDef+yBCrelaDef+xSeparation+ySeparation+
+                 chasing+deltaS+deltaA+deltaXS+deltaYS+sideline_dist,
+                    data = train_reg,
+               family = "binomial")
+
+summary(log_mod)
+glm.probs1=predict(log_mod,test_reg,type="response")
+n=dim(test_reg)[1]
+glm.pred1=rep(0,n)
+glm.pred1[glm.probs1>0.5]=1
+confusionMatrix(table(glm.pred1,test_reg$tackleMade))
+
+# QDA is best model
+pred1 = suppressWarnings(round(predict(QDA_mod, defender_data)$posterior[,2],
+              digits = 4))
+defender_data$tackleProbability <- pred1
+
+single_game <- defender_data %>% filter(gameId == 2022101605 & playId == 3778)
+
+ggplot(single_game,
+       aes(x=x,y=y, group = displayName, 
+           color = tackleProbability)) +
+  geom_point() + facet_grid(playId ~ .)
+
+
+ggplot(single_game,
+       aes(x=frameId,y= tackleProbability, color = displayName )) + 
+  geom_line() 
+
+# reset single_game data frame to graph new data
+single_game <- defender_data %>% filter(playId == 1182	
+                                          & gameId == 2022102000)
+
+ggplot(single_game,
+       aes(x=x,y=y, group = displayName, 
+           color = tackleProbability)) + 
+  geom_point() + facet_grid(playId ~ .) 
+
+ggplot(single_game,
+       aes(x=frameId,y= tackleProbability, color = displayName )) + 
+  geom_line() 
+
+```
+
+aggregate MTOE for all players with missed tackles
+```{r defineMistackle}
+
+mistackle_data <- defender_data %>%
+  filter(pff_missedTackle == 1)
+
+mistackle_data_BC <- ballCarrier_data %>%
+  filter(pff_missedTackle == 1) %>%
+  rename(tackleProbabilityBC = tackleProbability) %>%
+  dplyr::select(c(gameId, playId, nflId, displayName,
+                  frameId, tackleProbabilityBC))
+
+mistackle_data <- inner_join(mistackle_data, mistackle_data_BC, 
+  by = c("gameId" = "gameId", "playId" = "playId", "nflId" = "nflId", 
+         "frameId" = "frameId", "displayName" = "displayName"))
+
+mistackle_data <- mistackle_data %>%
+  group_by(gameId, playId, nflId) %>%
+  mutate(mistackleTackle = ifelse(tackleProbability > 0.5 &
+                        tackleProbabilityBC < 0.5, 1, 0)) %>%
+  dplyr::select(c(gameId, playId, nflId, displayName,mistackleTackle)) %>%
+  # , maxTackle,maxBCTackle
+  distinct()
+
+actual_mistackles <- tackles %>%
+  filter(pff_missedTackle == 1 & gameId %in% mistackle_data$gameId) %>%
+  dplyr::select(-c(gameId, playId, tackle, assist, forcedFumble)) %>%
+  group_by(nflId) %>%
+  mutate(tot_mistackles = sum(pff_missedTackle)) %>%
+  dplyr::select(-c(pff_missedTackle)) %>%
+  distinct()
+
+mistackle_data <- mistackle_data %>%
+  group_by(nflId)  %>%
+  mutate(sumTackle = sum(mistackleTackle))  %>%
+   dplyr::select(c(nflId, displayName, sumTackle)) %>%
+  distinct()
+
+mistackle_data <- inner_join(mistackle_data, actual_mistackles, 
+                             by = c("nflId"="nflId")) %>%
+  distinct() %>%
+  mutate(MTOE = tot_mistackles - sumTackle) %>%
+  rename(player = displayName, actual_missed_tackles = tot_mistackles) %>%
+  dplyr::select(nflId, player, actual_missed_tackles, MTOE)
+```
+
+create visuals about MTOE
+```{r countMistackles}
+ggplot(mistackle_data, aes(x=MTOE)) + geom_bar() +
+  labs(title = "Distribution of Missed Tackles Over Expected",
+       x = "MTOE")
+
+ggplot(mistackle_data, aes(x=MTOE, actual_missed_tackles)) + geom_point() +
+  labs(title = "Distribution of Missed Tackles Over Expected",
+       x = "MTOE", y = "Actual Number of Missed Tackles")
+```
+
+create more visuals
+```{r MergeProb}
+defender_probs <- defender_data %>% dplyr::select(c(gameId, playId,
+  frameId, nflId, displayName, x, y, tackleProbability))
+
+defender_probs$probs_type <- 'defender'
+
+BC_probs <- ballCarrier_data %>% dplyr::select(c(gameId, playId,
+  frameId, nflId, displayName, x, y, tackleProbability))
+
+BC_probs$probs_type <- 'ball_carrier'
+
+tackle_probs <- rbind(defender_probs, BC_probs)
+
+single_game <- tackle_probs %>% filter(gameId == 2022101605 & nflId == 40017
+                                          & playId == 3778)
+
+single_game <- inner_join(single_game, plays,
+                          by = c("gameId" = "gameId", "playId" = "playId"))
+
+ggplot(single_game,
+       aes(x=frameId,y= tackleProbability, color = displayName )) +
+  geom_line() + facet_grid(probs_type ~ .) + labs(title = "Tackling probabilities during missed tackle by Tyrann Mathieu",caption = "(2:10) (Shotgun) J.Burrow pass short left to J.Chase for 60 yards, \n TOUCHDOWN. Pass 10, YAC 50")
+
+# reset single_game data frame to graph new data
+single_game <- tackle_probs %>% filter(playId == 1182 & nflId == 44862 
+                                          & gameId == 2022102000)
+
+
+single_game <- inner_join(single_game, plays,
+                          by = c("gameId" = "gameId", "playId" = "playId"))
+
+ggplot(single_game,
+       aes(x=frameId,y= tackleProbability, color = displayName )) +
+  geom_line() + facet_grid(probs_type ~ .) + labs(title = "Tackling probabilities during missed tackle by Justin Evans",caption = "(9:56) (Shotgun) K.Murray pass short left to K.Ingram to ARZ 49 for \n 24 yards (C.Granderson).")
+
+```
+
